@@ -12,6 +12,7 @@
     "vite": "^7.2.2"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.83.0",
     "@turf/area": "^7.2.0",
     "@turf/bbox": "^7.2.0",
     "@turf/boolean-within": "^7.2.0",

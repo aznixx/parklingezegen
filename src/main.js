@@ -8,6 +8,7 @@ import area from '@turf/area';
 import bbox from '@turf/bbox';
 import length from '@turf/length';
 import { boomGebieden, usageByType } from './tree-zones-data.js';
+import { supabase } from './supabaseClient.js';
 
 // Mode Management
 let currentMode = null; // 'visitor' or 'staff'
@@ -87,7 +88,23 @@ function startMode(mode) {
   if (!isMobile) {
     const modeSwitcherBtn = document.createElement('button');
     modeSwitcherBtn.className = 'mode-switcher-btn';
-    modeSwitcherBtn.innerHTML = `<span class="mode-switcher-btn__icon">${mode === 'visitor' ? '👥' : '🔧'}</span>${mode === 'visitor' ? 'Bezoeker Modus' : 'Medewerker Modus'}`;
+    
+    // Use SVG icons instead of emojis for consistency
+    const visitorIcon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+      <circle cx="9" cy="7" r="4"></circle>
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+      <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+    </svg>`;
+    
+    const staffIcon = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+    </svg>`;
+    
+    modeSwitcherBtn.innerHTML = `
+      <span class="mode-switcher-btn__icon">${mode === 'visitor' ? visitorIcon : staffIcon}</span>
+      <span>${mode === 'visitor' ? 'Bezoeker Modus' : 'Medewerker Modus'}</span>
+    `;
     modeSwitcherBtn.title = 'Verander modus';
     document.body.appendChild(modeSwitcherBtn);
 
@@ -314,6 +331,7 @@ const lingezegenPark = {
 
 // Load from localStorage or use default data
 const loadBoomGebieden = () => {
+  // Start with localStorage or default
   const saved = localStorage.getItem('boomGebiedenMetGebruik');
   if (saved) {
     try {
@@ -351,7 +369,181 @@ const saveBoomGebieden = () => {
   }
 };
 
+// ============================================
+// SUPABASE DATABASE FUNCTIONS
+// ============================================
+
+// Load zones from Supabase
+async function loadZonesFromDatabase() {
+  try {
+    const { data, error } = await supabase
+      .from('zones')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    if (data && data.length > 0) {
+      // Convert database format to GeoJSON
+      const features = data.map(zone => ({
+        type: 'Feature',
+        properties: {
+          id: zone.id,
+          naam: zone.naam,
+          soort: zone.soort,
+          type: zone.type,
+          color: zone.color,
+          toepassingen: zone.toepassingen,
+          photos: zone.photos || []
+        },
+        geometry: zone.geometry
+      }));
+
+      return {
+        type: 'FeatureCollection',
+        features: features
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Error loading zones from database:', error);
+    return null;
+  }
+}
+
+// Save zone to Supabase
+async function saveZoneToDatabase(feature) {
+  try {
+    const zoneData = {
+      naam: feature.properties.naam,
+      soort: feature.properties.soort,
+      type: feature.properties.type,
+      color: feature.properties.color,
+      toepassingen: feature.properties.toepassingen,
+      geometry: feature.geometry,
+      photos: feature.properties.photos || []
+    };
+
+    const { data, error } = await supabase
+      .from('zones')
+      .insert([zoneData])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Update the feature with the database ID
+    feature.properties.id = data.id;
+    
+    console.log('Zone saved to database:', data);
+    return data;
+  } catch (error) {
+    console.error('Error saving zone to database:', error);
+    showNotification('Fout bij opslaan naar database', 'error');
+    throw error;
+  }
+}
+
+// Update zone in Supabase
+async function updateZoneInDatabase(feature) {
+  try {
+    const zoneData = {
+      naam: feature.properties.naam,
+      soort: feature.properties.soort,
+      type: feature.properties.type,
+      color: feature.properties.color,
+      toepassingen: feature.properties.toepassingen,
+      geometry: feature.geometry,
+      photos: feature.properties.photos || []
+    };
+
+    const { data, error } = await supabase
+      .from('zones')
+      .update(zoneData)
+      .eq('id', feature.properties.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    console.log('Zone updated in database:', data);
+    return data;
+  } catch (error) {
+    console.error('Error updating zone in database:', error);
+    showNotification('Fout bij updaten in database', 'error');
+    throw error;
+  }
+}
+
+// Delete zone from Supabase
+async function deleteZoneFromDatabase(zoneId) {
+  try {
+    const { error } = await supabase
+      .from('zones')
+      .delete()
+      .eq('id', zoneId);
+
+    if (error) throw error;
+
+    console.log('Zone deleted from database:', zoneId);
+  } catch (error) {
+    console.error('Error deleting zone from database:', error);
+    showNotification('Fout bij verwijderen uit database', 'error');
+    throw error;
+  }
+}
+
+// Subscribe to real-time changes
+function subscribeToZoneChanges() {
+  const channel = supabase
+    .channel('zones-changes')
+    .on('postgres_changes', 
+      { 
+        event: '*', 
+        schema: 'public', 
+        table: 'zones' 
+      }, 
+      async (payload) => {
+        console.log('Database change detected:', payload);
+        
+        // Reload zones from database
+        const freshZones = await loadZonesFromDatabase();
+        if (freshZones) {
+          boomGebiedenMetGebruik = freshZones;
+          addCustomSourcesAndLayers();
+          if (adminMode) {
+            refreshZonesList();
+          }
+          showNotification('Zones bijgewerkt', 'info');
+        }
+      }
+    )
+    .subscribe();
+
+  return channel;
+}
+
 let boomGebiedenMetGebruik = loadBoomGebieden();
+
+// Load from database in background and update if available
+(async () => {
+  const dbZones = await loadZonesFromDatabase();
+  if (dbZones && dbZones.features.length > 0) {
+    console.log('Loaded zones from Supabase database');
+    boomGebiedenMetGebruik = dbZones;
+    
+    // Refresh map if it's already initialized
+    if (typeof addCustomSourcesAndLayers === 'function') {
+      addCustomSourcesAndLayers();
+    }
+  }
+  
+  // Subscribe to real-time changes
+  if (currentMode === 'staff') {
+    subscribeToZoneChanges();
+  }
+})();
 
 const defaultTypeMeta = {
   label: 'Boomzone',
@@ -815,6 +1007,38 @@ adminPanel.innerHTML = `
     <button class="admin-panel__close">×</button>
   </div>
   <div class="admin-panel__content">
+    <!-- Zone Templates -->
+    <div class="admin-section">
+      <h3>Zone Sjablonen</h3>
+      <p class="admin-hint">Klik op een sjabloon om snel een vooraf ingevulde zone te maken</p>
+      <div class="templates-grid">
+        <button class="template-btn" data-template="wetland_forest">
+          <span class="template-icon">🌊</span>
+          <span class="template-name">Waterrijk Bos</span>
+        </button>
+        <button class="template-btn" data-template="orchard">
+          <span class="template-icon">🍎</span>
+          <span class="template-name">Boomgaard</span>
+        </button>
+        <button class="template-btn" data-template="nut_grove">
+          <span class="template-icon">🌰</span>
+          <span class="template-name">Notengaard</span>
+        </button>
+        <button class="template-btn" data-template="mixed_woodland">
+          <span class="template-icon">🌳</span>
+          <span class="template-name">Gemengd Bos</span>
+        </button>
+        <button class="template-btn" data-template="food_forest">
+          <span class="template-icon">🥗</span>
+          <span class="template-name">Voedselbos</span>
+        </button>
+        <button class="template-btn" data-template="hedgerow">
+          <span class="template-icon">🪵</span>
+          <span class="template-name">Heggen</span>
+        </button>
+      </div>
+    </div>
+    
     <div class="admin-section">
       <h3>Tekengereedschap</h3>
       <p class="admin-hint">Gebruik de tekengereedschappen op de kaart om polygonen te maken</p>
@@ -826,7 +1050,7 @@ adminPanel.innerHTML = `
     
     <div class="admin-section">
       <h3>Zone Formulier</h3>
-      <form id="zoneForm">
+      <form id="zoneForm" autocomplete="off">
         <div class="form-group">
           <label>Zonenaam *</label>
           <input type="text" id="zoneName" required placeholder="bijv., Nieuwe bomenzone">
@@ -869,23 +1093,51 @@ adminPanel.innerHTML = `
         
         <div class="form-group">
           <label>Foto's toevoegen</label>
-          <input type="file" id="zonePhoto" accept="image/*" multiple>
-          <p class="admin-hint" style="margin-top: 5px;">Upload foto's van de zone</p>
+          <div class="photo-dropzone" id="photoDropzone">
+            <input type="file" id="zonePhoto" accept="image/*" multiple style="display: none;">
+            <div class="dropzone-placeholder">
+              <span class="dropzone-icon">📸</span>
+              <p>Sleep foto's hierheen of klik om te selecteren</p>
+              <span class="admin-hint">Meerdere bestanden tegelijk toegestaan</span>
+            </div>
+            <div class="photo-previews" id="photoPreviewsContainer"></div>
+          </div>
         </div>
         
-        <button type="submit" class="admin-btn admin-btn-primary">💾 Zone Opslaan</button>
+        <div class="form-actions">
+          <button type="submit" class="admin-btn admin-btn-primary">💾 Zone Opslaan</button>
+        </div>
       </form>
     </div>
     
     <div class="admin-section">
       <h3>Bestaande Zones</h3>
+      <div class="zones-controls">
+        <input type="text" id="zoneSearchInput" class="search-input" placeholder="🔍 Zoek zones... (Ctrl+F)">
+        <div class="filter-controls">
+          <select id="typeFilter" class="filter-select">
+            <option value="">Alle Types</option>
+            <option value="loofbos">Loofbos</option>
+            <option value="gemengd_bos">Gemengd Bos</option>
+            <option value="oeverbos">Oeverbos</option>
+            <option value="moerasbos">Moerasbos</option>
+            <option value="voedselbos">Voedselbos</option>
+          </select>
+          <select id="sortBy" class="filter-select">
+            <option value="name">Sorteer: Naam</option>
+            <option value="date">Sorteer: Datum</option>
+            <option value="type">Sorteer: Type</option>
+            <option value="size">Sorteer: Grootte</option>
+          </select>
+        </div>
+        <div class="bulk-actions" id="bulkActionsBar" style="display: none;">
+          <span id="selectedCount">0 geselecteerd</span>
+          <button class="admin-btn admin-btn-small" id="bulkDeleteBtn">🗑️ Verwijder</button>
+          <button class="admin-btn admin-btn-small" id="bulkExportBtn">📥 Export</button>
+          <button class="admin-btn admin-btn-small" id="deselectAllBtn">✕ Deselecteer</button>
+        </div>
+      </div>
       <div id="zonesList" class="zones-list"></div>
-    </div>
-    
-    <div class="admin-section">
-      <h3>Statistieken</h3>
-      <div id="statsContainer" class="stats-container"></div>
-      <button class="admin-btn" id="refreshStats">📊 Ververs Statistieken</button>
     </div>
     
     <div class="admin-section">
@@ -1138,7 +1390,6 @@ draw = new MapboxDraw({
       adminToggle.classList.add('active');
       map.addControl(draw, 'top-left');
       refreshZonesList();
-      updateStatistics(); // Automatisch statistieken laden
     } else {
       adminPanel.classList.remove('active');
       adminToggle.classList.remove('active');
@@ -1168,21 +1419,381 @@ draw = new MapboxDraw({
     }
   });
 
+  // ============================================
+  // PRODUCTIVITY FEATURES
+  // ============================================
+
+  // Zone Templates
+  const zoneTemplates = {
+    wetland_forest: {
+      naam: 'Waterrijk Bos',
+      soort: 'Wilg, Populier, Els',
+      type: 'moerasbos',
+      color: '#6495ed',
+      toepassingen: 'Ooibos met wilgen, populieren en elzen voor waterbuffering'
+    },
+    orchard: {
+      naam: 'Nieuwe Boomgaard',
+      soort: 'Appel, Peer, Pruim',
+      type: 'erfboomgaard',
+      color: '#ff6347',
+      toepassingen: 'Historische fruitbomen en erfgoedrassen'
+    },
+    nut_grove: {
+      naam: 'Notengaard',
+      soort: 'Walnoot, Hazelaar, Kastanje',
+      type: 'nut_grove',
+      color: '#8b4513',
+      toepassingen: 'Walnoten, hazelaars en andere noten voor voedsel en hout'
+    },
+    mixed_woodland: {
+      naam: 'Gemengd Bos',
+      soort: 'Eik, Beuk, Es',
+      type: 'gemengd_bos',
+      color: '#228b22',
+      toepassingen: 'Variatie aan loofbomen voor biodiversiteit'
+    },
+    food_forest: {
+      naam: 'Voedselbos',
+      soort: 'Diverse eetbare soorten',
+      type: 'voedselbos',
+      color: '#9370db',
+      toepassingen: 'Laag-op-laag voedselbos met diverse eetbare soorten'
+    },
+    hedgerow: {
+      naam: 'Heggenrij',
+      soort: 'Meidoorn, Sleedoorn, Haagbeuk',
+      type: 'heggenrij',
+      color: '#ffd700',
+      toepassingen: 'Natuurlijke afscheiding met biodiversiteit'
+    }
+  };
+
+  // Template buttons
+  document.querySelectorAll('.template-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const templateKey = btn.dataset.template;
+      const template = zoneTemplates[templateKey];
+      if (template) {
+        document.getElementById('zoneName').value = template.naam;
+        document.getElementById('zoneSpecies').value = template.soort;
+        document.getElementById('zoneType').value = template.type;
+        document.getElementById('zoneColor').value = template.color;
+        document.getElementById('colorPreview').textContent = template.color.toUpperCase();
+        document.getElementById('colorPreview').style.color = template.color;
+        showNotification(`Sjabloon "${template.naam}" geladen`, 'success');
+        
+        // Scroll to form
+        document.getElementById('zoneForm').scrollIntoView({ behavior: 'smooth' });
+      }
+    });
+  });
+
+  // Drag & Drop for Photos
+  const photoDropzone = document.getElementById('photoDropzone');
+  const photoInput = document.getElementById('zonePhoto');
+  const photoPreviewsContainer = document.getElementById('photoPreviewsContainer');
+
+  photoDropzone.addEventListener('click', (e) => {
+    if (e.target.closest('.photo-preview')) return;
+    photoInput.click();
+  });
+
+  photoDropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    photoDropzone.classList.add('dragover');
+  });
+
+  photoDropzone.addEventListener('dragleave', () => {
+    photoDropzone.classList.remove('dragover');
+  });
+
+  photoDropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    photoDropzone.classList.remove('dragover');
+    
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+      handlePhotoFiles(files);
+    }
+  });
+
+  photoInput.addEventListener('change', (e) => {
+    handlePhotoFiles(e.target.files);
+  });
+
+  function handlePhotoFiles(files) {
+    pendingPhotos = [];
+    photoPreviewsContainer.innerHTML = '';
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const reader = new FileReader();
+      
+      reader.onload = (event) => {
+        const photoData = {
+          url: event.target.result,
+          name: file.name,
+          timestamp: Date.now()
+        };
+        pendingPhotos.push(photoData);
+        
+        // Show preview
+        const preview = document.createElement('div');
+        preview.className = 'photo-preview';
+        preview.innerHTML = `
+          <img src="${photoData.url}" alt="${file.name}">
+          <button class="photo-preview-remove" data-index="${pendingPhotos.length - 1}">×</button>
+          <span class="photo-preview-name">${file.name}</span>
+        `;
+        photoPreviewsContainer.appendChild(preview);
+        
+        // Remove button
+        preview.querySelector('.photo-preview-remove').addEventListener('click', (e) => {
+          e.stopPropagation();
+          const index = parseInt(e.target.dataset.index);
+          pendingPhotos.splice(index, 1);
+          preview.remove();
+          updatePhotoPreviewIndices();
+        });
+      };
+      
+      reader.readAsDataURL(file);
+    }
+    
+    if (files.length > 0) {
+      showNotification(`${files.length} foto${files.length > 1 ? "'s" : ''} toegevoegd`, 'success');
+    }
+  }
+
+  function updatePhotoPreviewIndices() {
+    photoPreviewsContainer.querySelectorAll('.photo-preview-remove').forEach((btn, index) => {
+      btn.dataset.index = index;
+    });
+  }
+
+  // Live Search & Filter
+  const searchInput = document.getElementById('zoneSearchInput');
+  const typeFilter = document.getElementById('typeFilter');
+  const sortBy = document.getElementById('sortBy');
+  let currentSearchTerm = '';
+  let currentTypeFilter = '';
+  let currentSort = 'name';
+
+  searchInput.addEventListener('input', (e) => {
+    currentSearchTerm = e.target.value.toLowerCase();
+    refreshZonesList();
+  });
+
+  typeFilter.addEventListener('change', (e) => {
+    currentTypeFilter = e.target.value;
+    refreshZonesList();
+  });
+
+  sortBy.addEventListener('change', (e) => {
+    currentSort = e.target.value;
+    refreshZonesList();
+  });
+
+  // Bulk Selection
+  let selectedZones = new Set();
+
+  // Bulk operations are still available via keyboard shortcuts and zone list checkboxes
+  // No dedicated bulk edit button in quick actions anymore
+
+  document.getElementById('bulkDeleteBtn').addEventListener('click', () => {
+    if (selectedZones.size === 0) return;
+    if (confirm(`${selectedZones.size} zones verwijderen?`)) {
+      const zonesToDelete = Array.from(selectedZones);
+      zonesToDelete.forEach(zoneId => {
+        const index = boomGebiedenMetGebruik.features.findIndex(f => 
+          (f.properties.id || f.properties.naam) === zoneId
+        );
+        if (index !== -1) {
+          saveToHistory('delete', boomGebiedenMetGebruik.features[index]);
+          boomGebiedenMetGebruik.features.splice(index, 1);
+        }
+      });
+      saveBoomGebieden();
+      addCustomSourcesAndLayers();
+      selectedZones.clear();
+      refreshZonesList();
+      updateBulkActionsBar();
+      showNotification(`${zonesToDelete.length} zones verwijderd`, 'success');
+    }
+  });
+
+  document.getElementById('bulkExportBtn').addEventListener('click', () => {
+    if (selectedZones.size === 0) return;
+    const selectedFeatures = boomGebiedenMetGebruik.features.filter(f =>
+      selectedZones.has(f.properties.id || f.properties.naam)
+    );
+    const exportData = {
+      type: 'FeatureCollection',
+      features: selectedFeatures
+    };
+    const dataStr = JSON.stringify(exportData, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `selected-zones-${Date.now()}.geojson`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showNotification(`${selectedZones.size} zones geëxporteerd`, 'success');
+  });
+
+  document.getElementById('deselectAllBtn').addEventListener('click', () => {
+    selectedZones.clear();
+    updateBulkActionsBar();
+    refreshZonesList();
+  });
+
+  function updateBulkActionsBar() {
+    const bulkActionsBar = document.getElementById('bulkActionsBar');
+    const selectedCount = document.getElementById('selectedCount');
+    if (selectedZones.size > 0) {
+      bulkActionsBar.style.display = 'flex';
+      selectedCount.textContent = `${selectedZones.size} geselecteerd`;
+    } else {
+      bulkActionsBar.style.display = 'none';
+    }
+  }
+
+  // Keyboard Shortcuts
+  document.addEventListener('keydown', (e) => {
+    // Only when admin panel is active
+    if (!adminMode) return;
+
+    // Ctrl+S - Save
+    if (e.ctrlKey && e.key === 's') {
+      e.preventDefault();
+      document.getElementById('zoneForm').requestSubmit();
+    }
+
+    // Ctrl+Z - Undo
+    if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      undo();
+    }
+
+    // Ctrl+Y or Ctrl+Shift+Z - Redo
+    if ((e.ctrlKey && e.key === 'y') || (e.ctrlKey && e.shiftKey && e.key === 'z')) {
+      e.preventDefault();
+      redo();
+    }
+
+    // Ctrl+F - Focus search
+    if (e.ctrlKey && e.key === 'f') {
+      e.preventDefault();
+      const searchInput = document.getElementById('zoneSearchInput');
+      if (searchInput) searchInput.focus();
+    }
+
+    // Ctrl+N - New zone (focus name field)
+    if (e.ctrlKey && e.key === 'n') {
+      e.preventDefault();
+      document.getElementById('zoneName').focus();
+      document.getElementById('zoneForm').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // Ctrl+K - Show shortcuts
+    if (e.ctrlKey && e.key === 'k') {
+      e.preventDefault();
+      showShortcutsModal();
+    }
+
+    // Escape - Clear selection / close modals
+    if (e.key === 'Escape') {
+      selectedZones.clear();
+      updateBulkActionsBar();
+      refreshZonesList();
+    }
+
+    // Delete - Delete selected zones
+    if (e.key === 'Delete' && selectedZones.size > 0) {
+      const bulkDeleteBtn = document.getElementById('bulkDeleteBtn');
+      if (bulkDeleteBtn) bulkDeleteBtn.click();
+    }
+  });
+
+  // Show shortcuts modal function
+  function showShortcutsModal() {
+    const modal = document.createElement('div');
+    modal.className = 'shortcuts-modal';
+    modal.innerHTML = `
+      <div class="shortcuts-modal__overlay"></div>
+      <div class="shortcuts-modal__content">
+        <h3>⌨️ Sneltoetsen</h3>
+        <div class="shortcuts-list">
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>S</kbd>
+            <span>Zone opslaan</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>Z</kbd>
+            <span>Ongedaan maken</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>Y</kbd>
+            <span>Opnieuw</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>F</kbd>
+            <span>Zoeken</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>N</kbd>
+            <span>Nieuwe zone</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Ctrl</kbd> + <kbd>K</kbd>
+            <span>Sneltoetsen tonen</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Esc</kbd>
+            <span>Deselecteren / Sluiten</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Delete</kbd>
+            <span>Geselecteerde verwijderen</span>
+          </div>
+        </div>
+        <button class="admin-btn admin-btn-primary" onclick="this.closest('.shortcuts-modal').remove()">Sluiten</button>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    
+    modal.querySelector('.shortcuts-modal__overlay').addEventListener('click', () => modal.remove());
+  }
+
+  // Auto-save is still active in background (no toggle button needed)
+  
+  // Continue with existing drawing tools
+  document.getElementById('deleteShape').addEventListener('click', () => {
+    const selected = draw.getSelected();
+    if (selected.features.length > 0) {
+      selected.features.forEach(feature => {
+        draw.delete(feature.id);
+      });
+    }
+  });
+
+  // Edit mode tracking
+  let editingZoneId = null;
+  let editingFeature = null;
+
   // Zone form submission
-  document.getElementById('zoneForm').addEventListener('submit', (e) => {
+  document.getElementById('zoneForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   
   const drawnFeatures = draw.getAll();
-  if (drawnFeatures.features.length === 0) {
+  if (drawnFeatures.features.length === 0 && !editingZoneId) {
     alert('Teken eerst een polygoon op de kaart!');
     return;
   }
   
-  const lastFeature = drawnFeatures.features[drawnFeatures.features.length - 1];
-  const coords = lastFeature.geometry.coordinates;
-  
   const properties = {
-    id: Date.now() + '-' + Math.random().toString(36).substr(2, 9),
     naam: document.getElementById('zoneName').value,
     soort: document.getElementById('zoneSpecies').value,
     type: document.getElementById('zoneType').value,
@@ -1195,82 +1806,290 @@ draw = new MapboxDraw({
     properties.photos = pendingPhotos;
   }
   
-  const newZone = {
-    type: 'Feature',
-    properties: properties,
-    geometry: {
-      type: 'Polygon',
-      coordinates: coords
+  if (editingZoneId && editingFeature) {
+    // EDIT MODE - Update existing zone
+    Object.assign(editingFeature.properties, properties);
+    
+    // If there's a new drawing, update geometry too
+    if (drawnFeatures.features.length > 0) {
+      const lastFeature = drawnFeatures.features[drawnFeatures.features.length - 1];
+      editingFeature.geometry.coordinates = lastFeature.geometry.coordinates;
     }
-  };
-  
-  // Add to boomGebiedenMetGebruik
-  boomGebiedenMetGebruik.features.push(newZone);
-  
-  console.log('New zone created:', newZone);
-  console.log('Photos attached:', pendingPhotos.length);
-  
-  // Save to history
-  saveToHistory('add', newZone);
-  
-  // Save to localStorage
-  saveBoomGebieden();
-  
-  // Refresh the map
-  addCustomSourcesAndLayers();
-  
-  console.log('Zone added to map, total zones:', boomGebiedenMetGebruik.features.length);
+    
+    // Update in database
+    await updateZoneInDatabase(editingFeature);
+    
+    saveToHistory('edit', editingFeature);
+    saveBoomGebieden();
+    addCustomSourcesAndLayers();
+    
+    showNotification(`Zone "${properties.naam}" bijgewerkt!`, 'success');
+    
+    // Clear edit mode
+    editingZoneId = null;
+    editingFeature = null;
+  } else {
+    // CREATE MODE - Add new zone
+    const lastFeature = drawnFeatures.features[drawnFeatures.features.length - 1];
+    const coords = lastFeature.geometry.coordinates;
+    
+    properties.id = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+    
+    const newZone = {
+      type: 'Feature',
+      properties: properties,
+      geometry: {
+        type: 'Polygon',
+        coordinates: coords
+      }
+    };
+    
+    // Save to database first
+    await saveZoneToDatabase(newZone);
+    
+    boomGebiedenMetGebruik.features.push(newZone);
+    
+    console.log('New zone created:', newZone);
+    console.log('Photos attached:', pendingPhotos.length);
+    
+    saveToHistory('add', newZone);
+    saveBoomGebieden();
+    addCustomSourcesAndLayers();
+    
+    console.log('Zone added to map, total zones:', boomGebiedenMetGebruik.features.length);
+    
+    showNotification(`Zone "${newZone.properties.naam}" succesvol toegevoegd!`, 'success');
+  }
   
   // Clear form and drawing
   document.getElementById('zoneForm').reset();
   document.getElementById('zoneColor').value = '#4ade80';
   document.getElementById('colorPreview').textContent = '#4ADE80';
-  pendingPhotos = []; // Clear pending photos
+  pendingPhotos = [];
+  photoPreviewsContainer.innerHTML = '';
   draw.deleteAll();
   
   // Refresh zones list
   refreshZonesList();
-  
-  showNotification(`Zone "${newZone.properties.naam}" succesvol toegevoegd!`, 'success');
 });
 
-// Refresh zones list
+// Refresh zones list with search, filter, and sort
 function refreshZonesList() {
   const zonesList = document.getElementById('zonesList');
   zonesList.innerHTML = '';
   
-  boomGebiedenMetGebruik.features.forEach((feature, index) => {
+  // Filter zones
+  let filteredZones = boomGebiedenMetGebruik.features.filter(feature => {
+    const props = feature.properties;
+    const matchesSearch = !currentSearchTerm || 
+      (props.naam && props.naam.toLowerCase().includes(currentSearchTerm)) ||
+      (props.type && props.type.toLowerCase().includes(currentSearchTerm)) ||
+      (props.soort && props.soort.toLowerCase().includes(currentSearchTerm));
+    
+    const matchesType = !currentTypeFilter || props.type === currentTypeFilter;
+    
+    return matchesSearch && matchesType;
+  });
+  
+  // Sort zones
+  filteredZones.sort((a, b) => {
+    switch (currentSort) {
+      case 'name':
+        return (a.properties.naam || '').localeCompare(b.properties.naam || '');
+      case 'type':
+        return (a.properties.type || '').localeCompare(b.properties.type || '');
+      case 'date':
+        return (b.properties.id || '').localeCompare(a.properties.id || '');
+      case 'size':
+        const areaA = area(a);
+        const areaB = area(b);
+        return areaB - areaA;
+      default:
+        return 0;
+    }
+  });
+  
+  // Render zones
+  filteredZones.forEach((feature, index) => {
     const zoneItem = document.createElement('div');
     zoneItem.className = 'zone-item';
+    
+    const zoneId = feature.properties.id || feature.properties.naam;
+    const isSelected = selectedZones.has(zoneId);
+    if (isSelected) {
+      zoneItem.classList.add('selected');
+    }
+    
     const colorIndicator = feature.properties.color 
       ? `<span class="zone-item__color" style="background-color: ${feature.properties.color}"></span>`
       : '';
+    
+    const bulkCheckbox = document.body.classList.contains('bulk-select-mode')
+      ? `<input type="checkbox" class="zone-item__checkbox" ${isSelected ? 'checked' : ''} data-zone-id="${zoneId}">`
+      : '';
+    
+    const zoneArea = (area(feature) / 10000).toFixed(2);
+    
     zoneItem.innerHTML = `
+      ${bulkCheckbox}
       ${colorIndicator}
       <div class="zone-item__info">
-        <strong>${feature.properties.naam}</strong>
+        <strong class="zone-item__name" contenteditable="false" data-zone-id="${zoneId}">${feature.properties.naam}</strong>
         <span class="zone-item__type">${feature.properties.type}</span>
+        <span class="zone-item__area">${zoneArea} ha</span>
       </div>
-      <button class="zone-item__delete" data-index="${index}">🗑️</button>
+      <div class="zone-item__actions">
+        <button class="zone-item__zoom" data-zone-id="${zoneId}" title="Zoom naar zone">🔍</button>
+        <button class="zone-item__edit" data-zone-id="${zoneId}" title="Bewerk">✏️</button>
+        <button class="zone-item__delete" data-zone-id="${zoneId}" title="Verwijder">🗑️</button>
+      </div>
     `;
     zonesList.appendChild(zoneItem);
   });
   
-  // Add delete handlers
-  document.querySelectorAll('.zone-item__delete').forEach(btn => {
+  // Show results count
+  if (currentSearchTerm || currentTypeFilter) {
+    const resultsInfo = document.createElement('div');
+    resultsInfo.className = 'search-results-info';
+    resultsInfo.textContent = `${filteredZones.length} van ${boomGebiedenMetGebruik.features.length} zones`;
+    zonesList.insertBefore(resultsInfo, zonesList.firstChild);
+  }
+  
+  // Add event handlers
+  document.querySelectorAll('.zone-item__checkbox').forEach(checkbox => {
+    checkbox.addEventListener('change', (e) => {
+      const zoneId = e.target.dataset.zoneId;
+      if (e.target.checked) {
+        selectedZones.add(zoneId);
+      } else {
+        selectedZones.delete(zoneId);
+      }
+      updateBulkActionsBar();
+      refreshZonesList();
+    });
+  });
+  
+  document.querySelectorAll('.zone-item__zoom').forEach(btn => {
     btn.addEventListener('click', (e) => {
-      const index = parseInt(e.target.dataset.index);
-      const zone = boomGebiedenMetGebruik.features[index];
-      const zoneName = zone.properties.naam;
-      if (confirm(`Zone "${zoneName}" verwijderen?`)) {
-        // Save to history before deleting
-        saveToHistory('delete', zone);
+      const zoneId = e.target.dataset.zoneId;
+      const feature = boomGebiedenMetGebruik.features.find(f => 
+        (f.properties.id || f.properties.naam) === zoneId
+      );
+      if (feature) {
+        const bounds = bbox(feature);
+        map.fitBounds(bounds, { padding: 100, maxZoom: 16 });
+        showZonePanel(feature);
+      }
+    });
+  });
+  
+  document.querySelectorAll('.zone-item__edit').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const zoneId = e.target.dataset.zoneId;
+      const feature = boomGebiedenMetGebruik.features.find(f => 
+        (f.properties.id || f.properties.naam) === zoneId
+      );
+      if (feature) {
+        // Set edit mode
+        editingZoneId = zoneId;
+        editingFeature = feature;
         
-        boomGebiedenMetGebruik.features.splice(index, 1);
-        saveBoomGebieden(); // Save after deletion
-        addCustomSourcesAndLayers();
-        refreshZonesList();
-        showNotification(`Zone "${zoneName}" verwijderd`, 'info');
+        // Load zone data into form
+        document.getElementById('zoneName').value = feature.properties.naam || '';
+        document.getElementById('zoneSpecies').value = feature.properties.soort || '';
+        document.getElementById('zoneType').value = feature.properties.type || '';
+        document.getElementById('zoneColor').value = feature.properties.color || '#4ade80';
+        document.getElementById('colorPreview').textContent = (feature.properties.color || '#4ade80').toUpperCase();
+        
+        // Load photos if they exist
+        if (feature.properties.photos && feature.properties.photos.length > 0) {
+          pendingPhotos = [...feature.properties.photos];
+          photoPreviewsContainer.innerHTML = '';
+          feature.properties.photos.forEach((photoData, index) => {
+            const preview = document.createElement('div');
+            preview.className = 'photo-preview';
+            preview.innerHTML = `
+              <img src="${photoData}" alt="Preview ${index + 1}">
+              <button class="photo-preview__remove" data-index="${index}">×</button>
+            `;
+            photoPreviewsContainer.appendChild(preview);
+          });
+        }
+        
+        // Load geometry into draw for editing
+        draw.deleteAll();
+        draw.add(feature);
+        
+        // Zoom to feature
+        const bounds = turf.bbox(feature);
+        map.fitBounds(bounds, { padding: 100, maxZoom: 16 });
+        
+        // Scroll to form
+        document.getElementById('zoneForm').scrollIntoView({ behavior: 'smooth' });
+        showNotification('Zone geladen voor bewerking - pas aan en klik opslaan', 'info');
+      }
+    });
+  });
+  
+  document.querySelectorAll('.zone-item__delete').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const zoneId = e.target.dataset.zoneId;
+      const feature = boomGebiedenMetGebruik.features.find(f => 
+        (f.properties.id || f.properties.naam) === zoneId
+      );
+      if (feature) {
+        const zoneName = feature.properties.naam;
+        if (confirm(`Zone "${zoneName}" verwijderen?`)) {
+          // Delete from database if it has an ID
+          if (feature.properties.id) {
+            await deleteZoneFromDatabase(feature.properties.id);
+          }
+          
+          saveToHistory('delete', feature);
+          const index = boomGebiedenMetGebruik.features.indexOf(feature);
+          if (index !== -1) {
+            boomGebiedenMetGebruik.features.splice(index, 1);
+          }
+          saveBoomGebieden();
+          addCustomSourcesAndLayers();
+          refreshZonesList();
+          showNotification(`Zone "${zoneName}" verwijderd`, 'info');
+        }
+      }
+    });
+  });
+  
+  // Inline name editing
+  document.querySelectorAll('.zone-item__name').forEach(nameEl => {
+    nameEl.addEventListener('dblclick', (e) => {
+      e.target.contentEditable = 'true';
+      e.target.focus();
+      document.execCommand('selectAll', false, null);
+    });
+    
+    nameEl.addEventListener('blur', (e) => {
+      e.target.contentEditable = 'false';
+      const newName = e.target.textContent.trim();
+      const zoneId = e.target.dataset.zoneId;
+      const feature = boomGebiedenMetGebruik.features.find(f => 
+        (f.properties.id || f.properties.naam) === zoneId
+      );
+      if (feature && newName && newName !== feature.properties.naam) {
+        feature.properties.naam = newName;
+        saveBoomGebieden();
+        showNotification('Zone naam bijgewerkt', 'success');
+      }
+    });
+    
+    nameEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.target.blur();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.target.textContent = e.target.dataset.originalName || e.target.textContent;
+        e.target.blur();
       }
     });
   });
@@ -1306,39 +2125,6 @@ document.getElementById('resetData').addEventListener('click', () => {
     saveToHistory('reset', { timestamp: Date.now() });
     alert('Bomenzones zijn teruggezet naar standaardgegevens!');
   }
-});
-
-// Statistics refresh
-function updateStatistics() {
-  const stats = calculateZoneStatistics();
-  const statsContainer = document.getElementById('statsContainer');
-  
-  if (!statsContainer) {
-    console.error('Stats container not found!');
-    return;
-  }
-  
-  let html = '<div class="stats-grid">';
-  html += `<div class="stat-item"><span class="stat-label">Totaal Zones:</span><span class="stat-value">${stats.totalZones}</span></div>`;
-  html += `<div class="stat-item"><span class="stat-label">Totaal Oppervlakte:</span><span class="stat-value">${(stats.totalArea / 10000).toFixed(2)} ha</span></div>`;
-  
-  if (Object.keys(stats.byType).length > 0) {
-    html += '<h4 style="margin-top: 15px; margin-bottom: 10px; color: #1a1a1a;">Per Type:</h4>';
-    for (const [type, data] of Object.entries(stats.byType)) {
-      const meta = getTypeMeta(type);
-      const typeName = meta.label || type;
-      html += `<div class="stat-item"><span class="stat-label">${typeName}:</span><span class="stat-value">${data.count} zones (${(data.area / 10000).toFixed(2)} ha)</span></div>`;
-    }
-  }
-  html += '</div>';
-  
-  statsContainer.innerHTML = html;
-  console.log('Statistics updated:', stats);
-}
-
-document.getElementById('refreshStats').addEventListener('click', () => {
-  updateStatistics();
-  showNotification('Statistieken bijgewerkt', 'success');
 });
 
 // Import GeoJSON
@@ -2080,52 +2866,6 @@ function updateUndoRedoButtons() {
   if (redoBtn) redoBtn.disabled = historyIndex >= historyStack.length - 1;
 }
 
-// Statistics calculation
-function getAllZones() {
-  // Haal alle zones op: voorgedefinieerde + custom zones uit localStorage
-  const customZonesData = localStorage.getItem('customTreeZones');
-  const customZones = customZonesData ? JSON.parse(customZonesData) : { type: 'FeatureCollection', features: [] };
-  
-  // Combineer voorgedefinieerde zones met custom zones
-  return {
-    type: 'FeatureCollection',
-    features: [...boomGebieden.features, ...customZones.features]
-  };
-}
-
-function calculateZoneStatistics() {
-  const allZones = getAllZones();
-  const stats = {
-    totalZones: allZones.features.length,
-    totalArea: 0,
-    byType: {},
-    largestZone: null,
-    smallestZone: null
-  };
-  
-  allZones.features.forEach(feature => {
-    const type = feature.properties.type || 'onbekend';
-    const area = turf.area(feature);
-    
-    stats.totalArea += area;
-    
-    if (!stats.byType[type]) {
-      stats.byType[type] = { count: 0, area: 0 };
-    }
-    stats.byType[type].count++;
-    stats.byType[type].area += area;
-    
-    if (!stats.largestZone || area > turf.area(stats.largestZone)) {
-      stats.largestZone = feature;
-    }
-    if (!stats.smallestZone || area < turf.area(stats.smallestZone)) {
-      stats.smallestZone = feature;
-    }
-  });
-  
-  return stats;
-}
-
 // Search functionality
 let searchResults = [];
 let currentSearchIndex = 0;
@@ -2137,9 +2877,8 @@ function performSearch(query) {
   }
   
   const lowerQuery = query.toLowerCase();
-  const allZones = getAllZones();
   
-  searchResults = allZones.features.filter(feature => {
+  searchResults = boomGebiedenMetGebruik.features.filter(feature => {
     const name = (feature.properties.naam || '').toLowerCase();
     const type = (feature.properties.type || '').toLowerCase();
     const species = (feature.properties.soort || '').toLowerCase();
@@ -2398,8 +3137,6 @@ function printMap() {
   const mapContainer = document.getElementById('map');
   const canvas = mapContainer.querySelector('canvas');
   
-  const stats = calculateZoneStatistics();
-  
   printWindow.document.write(`
     <!DOCTYPE html>
     <html>
@@ -2409,10 +3146,6 @@ function printMap() {
         body { font-family: Arial, sans-serif; margin: 20px; }
         h1 { color: #333; }
         img { max-width: 100%; border: 1px solid #ccc; }
-        .stats { margin: 20px 0; }
-        .stats table { border-collapse: collapse; width: 100%; }
-        .stats th, .stats td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        .stats th { background-color: #cad400; color: white; }
         @media print {
           .no-print { display: none; }
         }
@@ -2422,60 +3155,10 @@ function printMap() {
       <h1>Park Lingezegen - Boomsoorten Overzicht</h1>
       <p>Gegenereerd op: ${new Date().toLocaleDateString('nl-NL')}</p>
       <img src="${canvas.toDataURL()}" alt="Kaart">
-      <div class="stats">
-        <h2>Statistieken</h2>
-        <p>Totaal aantal zones: ${stats.totalZones}</p>
-        <p>Totale oppervlakte: ${(stats.totalArea / 10000).toFixed(2)} hectare</p>
-      </div>
       <button class="no-print" onclick="window.print()">Print</button>
     </body>
     </html>
   `);
-}
-
-// Dark mode toggle
-let isDarkMode = false;
-
-function toggleDarkMode() {
-  isDarkMode = !isDarkMode;
-  document.body.classList.toggle('dark-mode', isDarkMode);
-  localStorage.setItem('darkMode', isDarkMode);
-  
-  // Update button
-  const btn = document.getElementById('darkModeBtn');
-  if (btn) {
-    btn.innerHTML = isDarkMode ? '☀️' : '🌙';
-  }
-}
-
-// 3D terrain toggle
-let is3DEnabled = false;
-
-function toggle3DTerrain() {
-  is3DEnabled = !is3DEnabled;
-  
-  if (is3DEnabled) {
-    map.addSource('terrain', {
-      type: 'raster-dem',
-      url: `https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=${MAPTILER_KEY}`,
-      tileSize: 256
-    });
-    map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
-    map.setPitch(60);
-    showNotification('3D terrein ingeschakeld', 'success');
-  } else {
-    map.setTerrain(null);
-    map.setPitch(0);
-    if (map.getSource('terrain')) {
-      map.removeSource('terrain');
-    }
-    showNotification('3D terrein uitgeschakeld', 'info');
-  }
-  
-  const btn = document.getElementById('terrain3DBtn');
-  if (btn) {
-    btn.classList.toggle('active', is3DEnabled);
-  }
 }
 
 // Notification system
